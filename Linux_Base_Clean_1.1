@@ -1,0 +1,326 @@
+#!/bin/bash
+
+################################################################################
+# Linux System Cleanup Script
+# This script safely removes temporary files, caches, and unnecessary data
+# Usage: sudo ./clean.sh [options]
+################################################################################
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Variables
+TOTAL_FREED=0
+DRY_RUN=false
+VERBOSE=false
+
+################################################################################
+# Functions
+################################################################################
+
+print_header() {
+    echo -e "${BLUE}================================${NC}"
+    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}================================${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✓ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠ $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}✗ $1${NC}"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        print_error "This script must be run as root"
+        exit 1
+    fi
+}
+
+get_size() {
+    du -sh "$1" 2>/dev/null | awk '{print $1}' || echo "0B"
+}
+
+add_freed_space() {
+    local size=$1
+    # Convert to bytes for calculation
+    local bytes=$(echo "$size" | numfmt --from=iec 2>/dev/null || echo 0)
+    TOTAL_FREED=$((TOTAL_FREED + bytes))
+}
+
+clean_package_cache() {
+    print_header "Cleaning Package Manager Caches"
+    
+    # APT (Debian/Ubuntu)
+    if command -v apt-get &> /dev/null; then
+        local size=$(get_size /var/cache/apt/archives)
+        if [ "$size" != "0B" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                echo "Would clean apt cache: $size"
+            else
+                apt-get clean
+                print_success "Cleaned apt cache: $size"
+            fi
+            add_freed_space "$size"
+        fi
+    fi
+    
+    # DNF (Fedora/RHEL)
+    if command -v dnf &> /dev/null; then
+        local size=$(get_size /var/cache/dnf)
+        if [ "$size" != "0B" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                echo "Would clean dnf cache: $size"
+            else
+                dnf clean all
+                print_success "Cleaned dnf cache: $size"
+            fi
+            add_freed_space "$size"
+        fi
+    fi
+    
+    # Pacman (Arch)
+    if command -v pacman &> /dev/null; then
+        local size=$(get_size /var/cache/pacman/pkg)
+        if [ "$size" != "0B" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                echo "Would clean pacman cache: $size"
+            else
+                pacman -Sc --noconfirm
+                print_success "Cleaned pacman cache: $size"
+            fi
+            add_freed_space "$size"
+        fi
+    fi
+}
+
+clean_temp_files() {
+    print_header "Cleaning Temporary Files"
+    
+    local dirs=("/tmp" "/var/tmp" "/var/cache/apt/archives" "/var/log")
+    
+    for dir in "${dirs[@]}"; do
+        if [ -d "$dir" ]; then
+            local size=$(get_size "$dir")
+            if [ "$DRY_RUN" = true ]; then
+                echo "Would clean $dir: $size"
+            else
+                case $dir in
+                    /tmp|/var/tmp)
+                        find "$dir" -type f -atime +7 -delete 2>/dev/null || true
+                        print_success "Cleaned $dir"
+                        ;;
+                    /var/log)
+                        find /var/log -type f -name "*.log" -mtime +30 -delete 2>/dev/null || true
+                        print_success "Cleaned old logs"
+                        ;;
+                esac
+            fi
+            add_freed_space "$size"
+        fi
+    done
+}
+
+clean_user_cache() {
+    print_header "Cleaning User Caches"
+    
+    for user_home in /home/*; do
+        if [ -d "$user_home" ]; then
+            local cache_dir="$user_home/.cache"
+            local size=$(get_size "$cache_dir" 2>/dev/null || echo "0B")
+            
+            if [ "$DRY_RUN" = true ]; then
+                echo "Would clean cache for $(basename "$user_home"): $size"
+            else
+                find "$cache_dir" -type f -atime +30 -delete 2>/dev/null || true
+                print_success "Cleaned cache for $(basename "$user_home")"
+            fi
+            add_freed_space "$size"
+        fi
+    done
+}
+
+clean_journal() {
+    print_header "Cleaning Systemd Journal"
+    
+    if command -v journalctl &> /dev/null; then
+        local size=$(du -sh /var/log/journal 2>/dev/null | awk '{print $1}' || echo "0B")
+        
+        if [ "$DRY_RUN" = true ]; then
+            echo "Would clean journal: $size"
+        else
+            journalctl --vacuum=30d
+            print_success "Cleaned systemd journal (keeping last 30 days)"
+        fi
+        add_freed_space "$size"
+    fi
+}
+
+clean_broken_packages() {
+    print_header "Cleaning Broken/Unused Packages"
+    
+    if command -v apt-get &> /dev/null; then
+        if [ "$DRY_RUN" = true ]; then
+            echo "Would remove broken packages"
+        else
+            apt-get autoremove -y
+            apt-get autoclean -y
+            print_success "Removed broken/unused packages"
+        fi
+    fi
+}
+
+clean_duplicate_files() {
+    print_header "Finding Duplicate Files"
+    
+    if command -v fdupes &> /dev/null; then
+        print_warning "Found duplicate files (not removed automatically)"
+        fdupes -r /home /opt 2>/dev/null | head -20 || true
+        echo "To remove duplicates, install: sudo apt-get install fdupes"
+    else
+        print_warning "fdupes not installed. Skipping duplicate file search."
+        echo "Install with: sudo apt-get install fdupes"
+    fi
+}
+
+show_disk_usage() {
+    print_header "Current Disk Usage"
+    
+    echo "Largest directories:"
+    du -sh /* 2>/dev/null | sort -rh | head -10
+}
+
+show_help() {
+    cat << EOF
+Linux Clean Script - System cleanup utility
+
+Usage: sudo ./clean.sh [OPTIONS]
+
+OPTIONS:
+    -d, --dry-run       Show what would be deleted without actually deleting
+    -v, --verbose       Show detailed output
+    -h, --help          Show this help message
+    -a, --all           Run all cleaning operations (default)
+    --cache-only        Clean only package caches
+    --temp-only         Clean only temporary files
+    --journal-only      Clean only systemd journal
+    --user-cache-only   Clean only user caches
+
+EXAMPLES:
+    sudo ./clean.sh                    # Run all cleaning operations
+    sudo ./clean.sh --dry-run          # Preview what would be cleaned
+    sudo ./clean.sh --cache-only       # Clean only package caches
+    sudo ./clean.sh -v                 # Verbose output
+
+EOF
+}
+
+################################################################################
+# Main Script
+################################################################################
+
+main() {
+    local mode="all"
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -a|--all)
+                mode="all"
+                shift
+                ;;
+            --cache-only)
+                mode="cache"
+                shift
+                ;;
+            --temp-only)
+                mode="temp"
+                shift
+                ;;
+            --journal-only)
+                mode="journal"
+                shift
+                ;;
+            --user-cache-only)
+                mode="user-cache"
+                shift
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+    
+    check_root
+    
+    if [ "$DRY_RUN" = true ]; then
+        print_warning "DRY RUN MODE - No files will be deleted"
+    fi
+    
+    echo ""
+    print_header "Linux System Cleanup Script"
+    echo "Started at: $(date)"
+    echo ""
+    
+    case $mode in
+        all)
+            clean_package_cache
+            clean_temp_files
+            clean_user_cache
+            clean_journal
+            clean_broken_packages
+            show_disk_usage
+            ;;
+        cache)
+            clean_package_cache
+            ;;
+        temp)
+            clean_temp_files
+            ;;
+        journal)
+            clean_journal
+            ;;
+        user-cache)
+            clean_user_cache
+            ;;
+    esac
+    
+    echo ""
+    print_header "Cleanup Complete"
+    echo "Finished at: $(date)"
+    
+    if [ "$TOTAL_FREED" -gt 0 ]; then
+        local freed=$(numfmt --to=iec-i --suffix=B $TOTAL_FREED 2>/dev/null || echo "~$(($TOTAL_FREED / 1024 / 1024))MB")
+        print_success "Estimated space freed: $freed"
+    fi
+    
+    echo ""
+}
+
+main "$@"
